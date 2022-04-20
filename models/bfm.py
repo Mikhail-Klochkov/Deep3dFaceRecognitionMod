@@ -1,12 +1,12 @@
 """This script defines the parametric 3d face model for Deep3DFaceRecon_pytorch
 """
 
-import numpy as np
-import  torch
-import torch.nn.functional as F
+import numpy as np, torch, torch.nn.functional as F, os
 from scipy.io import loadmat
 from util.load_mats import transferBFM09
-import os
+# add for visualization ()
+from utils_mesh import MeshOperator
+import open3d as op3d
 
 def perspective_projection(focal, center):
     # return p.T (N, 3) @ (3, 3) 
@@ -18,7 +18,9 @@ def perspective_projection(focal, center):
 
 class SH:
     def __init__(self):
+        # pi, 2pi/sqrt(3), pi/sqrt(2)
         self.a = [np.pi, 2 * np.pi / np.sqrt(3.), 2 * np.pi / np.sqrt(8.)]
+        # 1/2pi*sqrt(pi), sqrt(3)/2(sqrt(pi)), (sqrt(3)/2sqrt(pi))
         self.c = [1/np.sqrt(4 * np.pi), np.sqrt(3.) / np.sqrt(4 * np.pi), 3 * np.sqrt(5.) / np.sqrt(12 * np.pi)]
 
 
@@ -28,9 +30,7 @@ class ParametricFaceModel:
                 bfm_folder='./BFM', 
                 recenter=True,
                 camera_distance=10.,
-                init_lit=np.array([
-                    0.8, 0, 0, 0, 0, 0, 0, 0, 0
-                    ]),
+                init_lit=np.array([0.8, 0, 0, 0, 0, 0, 0, 0, 0]),
                 focal=1015.,
                 center=112.,
                 is_train=True,
@@ -38,6 +38,7 @@ class ParametricFaceModel:
         
         if not os.path.isfile(os.path.join(bfm_folder, default_name)):
             transferBFM09(bfm_folder)
+        # preprocessed model (contains only needed points for face model)
         model = loadmat(os.path.join(bfm_folder, default_name))
         # mean face shape. [3*N,1]
         self.mean_shape = model['meanshape'].astype(np.float32)
@@ -70,9 +71,11 @@ class ParametricFaceModel:
             self.mean_shape = mean_shape.reshape([-1, 1])
 
         self.persc_proj = perspective_projection(focal, center)
+        # by default BFM on CPU working
         self.device = 'cpu'
         self.camera_distance = camera_distance
         self.SH = SH()
+        # what is it?
         self.init_lit = init_lit.reshape([1, 1, -1]).astype(np.float32)
         
 
@@ -82,8 +85,19 @@ class ParametricFaceModel:
             if type(value).__module__ == np.__name__:
                 setattr(self, key, torch.tensor(value).to(device))
 
-    
-    def compute_shape(self, id_coeff, exp_coeff):
+
+    def compute_shape_numpy(self, id_coeff, dim:int=80):
+        if id_coeff.shape[0] != dim:
+            assert False, f'Incorrect shape of id_coeff: {id_coeff.shape} and dim: {dim}'
+        if not torch.is_tensor(id_coeff):
+            id_coeff = torch.from_numpy(id_coeff.astype(np.float32))
+        id_coeff = id_coeff.view(1, -1)
+        id_part = torch.einsum('ij,aj->ai', self.id_base[:, :dim], id_coeff)
+        face_shape = id_part + self.mean_shape.reshape([1, -1])
+        return face_shape
+
+
+    def compute_shape(self, id_coeff, exp_coeff=None):
         """
         Return:
             face_shape       -- torch.tensor, size (B, N, 3)
@@ -94,8 +108,11 @@ class ParametricFaceModel:
         """
         batch_size = id_coeff.shape[0]
         id_part = torch.einsum('ij,aj->ai', self.id_base, id_coeff)
-        exp_part = torch.einsum('ij,aj->ai', self.exp_base, exp_coeff)
-        face_shape = id_part + exp_part + self.mean_shape.reshape([1, -1])
+        face_shape = id_part + self.mean_shape.reshape([1, -1])
+        if exp_coeff is not None:
+            exp_part = torch.einsum('ij,aj->ai', self.exp_base, exp_coeff)
+            face_shape += exp_part
+
         return face_shape.reshape([batch_size, -1, 3])
     
 
@@ -113,7 +130,7 @@ class ParametricFaceModel:
             face_texture = face_texture / 255.
         return face_texture.reshape([batch_size, -1, 3])
 
-
+    # TODO: Didn't understand last 2 line with point_buf
     def compute_norm(self, face_shape):
         """
         Return:
@@ -122,21 +139,29 @@ class ParametricFaceModel:
         Parameters:
             face_shape       -- torch.tensor, size (B, N, 3)
         """
-
+        # face_buf is all triangles for BFM model
+        # face_shape is (B, N, 3), self.face_buf is (Ntriangles, 3) indeces from shape model
+        # (B, N_tri, 3) for all v1, v2, v3
         v1 = face_shape[:, self.face_buf[:, 0]]
         v2 = face_shape[:, self.face_buf[:, 1]]
         v3 = face_shape[:, self.face_buf[:, 2]]
+        # (B, N_tri, 3) for each
         e1 = v1 - v2
+        # (B, N_tri, 3) for each
         e2 = v2 - v3
+        # need take cross product for each (1, 3) pair of indeces (B, N_tri, 3) or (B, N_tri, 3)
         face_norm = torch.cross(e1, e2, dim=-1)
+        # need L2 normalize need (B, Ntri, 3)
         face_norm = F.normalize(face_norm, dim=-1, p=2)
+        # (B, Ntri, 3) + (B, 1, 3) (zeros)
         face_norm = torch.cat([face_norm, torch.zeros(face_norm.shape[0], 1, 3).to(self.device)], dim=1)
-        
+        # (B, Ntri+1, 3) with zeros in last point_buf contains (N_hz, 8)
         vertex_norm = torch.sum(face_norm[:, self.point_buf], dim=2)
         vertex_norm = F.normalize(vertex_norm, dim=-1, p=2)
         return vertex_norm
 
-
+    # correctness by lightening parameters
+    # TODO: How made this?
     def compute_color(self, face_texture, face_norm, gamma):
         """
         Return:
@@ -204,6 +229,7 @@ class ParametricFaceModel:
         ], dim=1).reshape([batch_size, 3, 3])
 
         rot = rot_z @ rot_y @ rot_x
+        # it's just transpose each matrix for each batch element?
         return rot.permute(0, 2, 1)
 
 
@@ -271,6 +297,22 @@ class ParametricFaceModel:
             'gamma': gammas,
             'trans': translations
         }
+
+
+    def compute_face_shape(self, coefs_id, coefs_exp=None):
+        assert len(coefs_id.shape) == 2
+        if coefs_exp is not None:
+            assert len(coefs_exp.shape) == 2
+        if coefs_exp is None:
+            coefs_exp = torch.zeros(1, 64)
+        if not torch.is_tensor(coefs_id):
+            coefs_id = torch.from_numpy(coefs_id.astype(np.float32))
+        if not torch.is_tensor(coefs_exp):
+            coefs_exp = torch.from_numpy(coefs_exp.astype(np.float32))
+        face_shape = self.compute_shape(coefs_id, coefs_exp)
+        return face_shape
+
+
     def compute_for_render(self, coeffs):
         """
         Return:
@@ -284,7 +326,6 @@ class ParametricFaceModel:
         face_shape = self.compute_shape(coef_dict['id'], coef_dict['exp'])
         rotation = self.compute_rotation(coef_dict['angle'])
 
-
         face_shape_transformed = self.transform(face_shape, rotation, coef_dict['trans'])
         face_vertex = self.to_camera(face_shape_transformed)
         
@@ -292,8 +333,20 @@ class ParametricFaceModel:
         landmark = self.get_landmarks(face_proj)
 
         face_texture = self.compute_texture(coef_dict['tex'])
+        # 3 last row didn't understand their meanings ('point_buf'), what is it?
         face_norm = self.compute_norm(face_shape)
         face_norm_roted = face_norm @ rotation
+        # did not understand
+        # check face model
+        pts = face_shape.squeeze().cpu().numpy()
+        colors = face_texture.squeeze().cpu().numpy()
+        triangles = self.face_buf.cpu().numpy()
+        face_mesh = MeshOperator.get_mesh_by(pts, triangles, colors)
+        face_mesh_without_colors = MeshOperator.get_mesh_by(pts, triangles)
+        op3d.visualization.draw_geometries([face_mesh])
+        face_mesh_without_colors.compute_vertex_normals()
+        op3d.visualization.draw_geometries([face_mesh_without_colors])
         face_color = self.compute_color(face_texture, face_norm_roted, coef_dict['gamma'])
-
+        face_mesh = MeshOperator.get_mesh_by(pts, triangles, face_color.detach().numpy()[0])
+        op3d.visualization.draw_geometries([face_mesh])
         return face_vertex, face_texture, face_color, landmark

@@ -16,7 +16,7 @@ class PerceptualLoss(nn.Module):
         self.recog_net = recog_net
         self.preprocess = lambda x: 2 * x - 1
         self.input_size=input_size
-    def forward(imageA, imageB, M):
+    def forward(self, imageA, imageB, M):
         """
         1 - cosine distance
         Parameters:

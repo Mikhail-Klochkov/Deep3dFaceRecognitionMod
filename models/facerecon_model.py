@@ -11,6 +11,10 @@ from util import util
 from util.nvdiffrast import MeshRenderer
 from util.preprocess import estimate_norm_torch
 
+# for debugging
+from utils_mesh import MeshOperator
+import open3d as op3d
+
 import trimesh
 from scipy.io import savemat
 
@@ -41,7 +45,6 @@ class FaceReconModel(BaseModel):
             parser.add_argument('--use_crop_face', type=util.str2bool, nargs='?', const=True, default=False, help='use crop mask for photo loss')
             parser.add_argument('--use_predef_M', type=util.str2bool, nargs='?', const=True, default=False, help='use predefined M for predicted face')
 
-            
             # augmentation parameters
             parser.add_argument('--shift_pixs', type=float, default=10., help='shift pixels')
             parser.add_argument('--scale_delta', type=float, default=0.1, help='delta scale factor')
@@ -58,16 +61,11 @@ class FaceReconModel(BaseModel):
             parser.add_argument('--w_lm', type=float, default=1.6e-3, help='weight for lm loss')
             parser.add_argument('--w_reflc', type=float, default=5.0, help='weight for reflc loss')
 
-
-
         opt, _ = parser.parse_known_args()
-        parser.set_defaults(
-                focal=1015., center=112., camera_d=10., use_last_fc=False, z_near=5., z_far=15.
-            )
+        parser.set_defaults(focal=1015., center=112., camera_d=10., use_last_fc=False, z_near=5., z_far=15.)
         if is_train:
-            parser.set_defaults(
-                use_crop_face=True, use_predef_M=False
-            )
+            # predefined masks and use crop_face
+            parser.set_defaults(use_crop_face=True, use_predef_M=False)
         return parser
 
     def __init__(self, opt):
@@ -94,7 +92,8 @@ class FaceReconModel(BaseModel):
             bfm_folder=opt.bfm_folder, camera_distance=opt.camera_d, focal=opt.focal, center=opt.center,
             is_train=self.isTrain, default_name=opt.bfm_model
         )
-        
+        # what is fov it?
+        # TODO: understand MeashRenderer
         fov = 2 * np.arctan(opt.center / opt.focal) * 180 / np.pi
         self.renderer = MeshRenderer(
             rasterize_fov=fov, znear=opt.z_near, zfar=opt.z_far, rasterize_size=int(2 * opt.center)
@@ -103,9 +102,7 @@ class FaceReconModel(BaseModel):
         if self.isTrain:
             self.loss_names = ['all', 'feat', 'color', 'lm', 'reg', 'gamma', 'reflc']
 
-            self.net_recog = networks.define_net_recog(
-                net_recog=opt.net_recog, pretrained_path=opt.net_recog_path
-                )
+            self.net_recog = networks.define_net_recog(net_recog=opt.net_recog, pretrained_path=opt.net_recog_path)
             # loss func name: (compute_%s_loss) % loss_name
             self.compute_feat_loss = perceptual_loss
             self.comupte_color_loss = photo_loss
@@ -124,19 +121,27 @@ class FaceReconModel(BaseModel):
         Parameters:
             input: a dictionary that contains the data itself and its metadata information.
         """
-        self.input_img = input['imgs'].to(self.device) 
+        self.input_img = input['imgs'].to(self.device)
         self.atten_mask = input['msks'].to(self.device) if 'msks' in input else None
         self.gt_lm = input['lms'].to(self.device)  if 'lms' in input else None
+        # from renderer M (extracted)
         self.trans_m = input['M'].to(self.device) if 'M' in input else None
         self.image_paths = input['im_paths'] if 'im_paths' in input else None
 
-    def forward(self):
+    # TODO: This part (Renderer need replace on another)
+    def forward(self, debug:bool=False):
         output_coeff = self.net_recon(self.input_img)
         self.facemodel.to(self.device)
-        self.pred_vertex, self.pred_tex, self.pred_color, self.pred_lm = \
-            self.facemodel.compute_for_render(output_coeff)
-        self.pred_mask, _, self.pred_face = self.renderer(
-            self.pred_vertex, self.facemodel.face_buf, feat=self.pred_color)
+        self.pred_vertex, self.pred_tex, self.pred_color, self.pred_lm = self.facemodel.compute_for_render(output_coeff)
+        # this is UV texture-vertex map
+        if debug:
+            pts = self.pred_vertex.squeeze().cpu().numpy()
+            colors = self.pred_tex.squeeze().cpu().numpy()
+            triangles = self.facemodel.face_buf.cpu().numpy()
+            face_mesh = MeshOperator.get_mesh_by(pts, triangles, colors)
+            #op3d.visualization.draw_geometries([face_mesh])
+        #self.pred_mask, _, self.pred_face = self.renderer(self.pred_vertex, self.facemodel.face_buf,
+        #                                                  feat=self.pred_color)
         
         self.pred_coeffs_dict = self.facemodel.split_coeff(output_coeff)
 
@@ -148,7 +153,7 @@ class FaceReconModel(BaseModel):
         trans_m = self.trans_m
         if not self.opt.use_predef_M:
             trans_m = estimate_norm_torch(self.pred_lm, self.input_img.shape[-2])
-
+        # predicted parameters with take account a affine transformations
         pred_feat = self.net_recog(self.pred_face, trans_m)
         gt_feat = self.net_recog(self.input_img, self.trans_m)
         self.loss_feat = self.opt.w_feat * self.compute_feat_loss(pred_feat, gt_feat)
@@ -156,10 +161,10 @@ class FaceReconModel(BaseModel):
         face_mask = self.pred_mask
         if self.opt.use_crop_face:
             face_mask, _, _ = self.renderer(self.pred_vertex, self.facemodel.front_face_buf)
-        
+        # face_mask from renderer what is it?
         face_mask = face_mask.detach()
-        self.loss_color = self.opt.w_color * self.comupte_color_loss(
-            self.pred_face, self.input_img, self.atten_mask * face_mask)
+        self.loss_color = self.opt.w_color * self.comupte_color_loss(self.pred_face,
+                                                                     self.input_img, self.atten_mask * face_mask)
         
         loss_reg, loss_gamma = self.compute_reg_loss(self.pred_coeffs_dict, self.opt)
         self.loss_reg = self.opt.w_reg * loss_reg
@@ -202,7 +207,7 @@ class FaceReconModel(BaseModel):
 
             self.output_vis = torch.tensor(
                     output_vis_numpy / 255., dtype=torch.float32
-                ).permute(0, 3, 1, 2).to(self.device)
+                ).permute(0, 3, 1, 2).to_tensor(self.device)
 
     def save_mesh(self, name):
 

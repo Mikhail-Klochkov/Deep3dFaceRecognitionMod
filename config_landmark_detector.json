@@ -1,0 +1,15 @@
+{
+    "facedetector": {
+        "insightface": {
+            "ctx_idx": "1",
+            "det_image_size": "640",
+	    "det_thresh": "0.4"
+        },
+        "dlib": {
+            "cnn": "False"
+        }
+    },
+    "landmarkdetector": {
+        "number_landmarks": "5"
+    }
+}

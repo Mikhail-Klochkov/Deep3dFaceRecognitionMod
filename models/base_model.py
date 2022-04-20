@@ -79,7 +79,7 @@ class BaseModel(ABC):
         pass
 
     @abstractmethod
-    def forward(self):
+    def forward(self, debug:bool=False):
         """Run forward pass; called by both functions <optimize_parameters> and <test>."""
         pass
 
@@ -109,22 +109,22 @@ class BaseModel(ABC):
             for name in self.parallel_names:
                 if isinstance(name, str):
                     module = getattr(self, name)
-                    setattr(self, name, module.to(self.device))
+                    setattr(self, name, module.to_tensor(self.device))
         else:
             for name in self.model_names:
                 if isinstance(name, str):
                     module = getattr(self, name)
                     if convert_sync_batchnorm:
                         module = torch.nn.SyncBatchNorm.convert_sync_batchnorm(module)
-                    setattr(self, name, torch.nn.parallel.DistributedDataParallel(module.to(self.device),
-                        device_ids=[self.device.index], 
-                        find_unused_parameters=True, broadcast_buffers=True))
+                    setattr(self, name, torch.nn.parallel.DistributedDataParallel(module.to_tensor(self.device),
+                                                                                  device_ids=[self.device.index],
+                                                                                  find_unused_parameters=True, broadcast_buffers=True))
             
             # DistributedDataParallel is not needed when a module doesn't have any parameter that requires a gradient.
             for name in self.parallel_names:
                 if isinstance(name, str) and name not in self.model_names:
                     module = getattr(self, name)
-                    setattr(self, name, module.to(self.device))
+                    setattr(self, name, module.to_tensor(self.device))
             
         # put state_dict of optimizer to gpu device
         if self.opt.phase != 'test':
@@ -152,14 +152,14 @@ class BaseModel(ABC):
                 net = getattr(self, name)
                 net.eval()
 
-    def test(self):
+    def test(self, debug:bool=False):
         """Forward function used in test time.
 
         This function wraps <forward> function in no_grad() so we don't save intermediate steps for backprop
         It also calls <compute_visuals> to produce additional visualization results
         """
         with torch.no_grad():
-            self.forward()
+            self.forward(debug=debug)
             self.compute_visuals()
 
     def compute_visuals(self):
@@ -213,8 +213,7 @@ class BaseModel(ABC):
         for name in self.model_names:
             if isinstance(name, str):
                 net = getattr(self, name)
-                if isinstance(net, torch.nn.DataParallel) or isinstance(net,
-                        torch.nn.parallel.DistributedDataParallel):
+                if isinstance(net, torch.nn.DataParallel) or isinstance(net,torch.nn.parallel.DistributedDataParallel):
                     net = net.module
                 save_dict[name] = net.state_dict()
                 
@@ -256,9 +255,11 @@ class BaseModel(ABC):
         state_dict = torch.load(load_path, map_location=self.device)
         print('loading the model from %s' % load_path)
 
+        # iterate over all models
         for name in self.model_names:
             if isinstance(name, str):
                 net = getattr(self, name)
+                # diif for multiple GPU's execution
                 if isinstance(net, torch.nn.DataParallel):
                     net = net.module
                 net.load_state_dict(state_dict[name])
@@ -277,9 +278,7 @@ class BaseModel(ABC):
                     print('Failed to load schedulers, set schedulers according to epoch count manually')
                     for i, sched in enumerate(self.schedulers):
                         sched.last_epoch = self.opt.epoch_count - 1
-                    
 
-            
 
     def print_networks(self, verbose):
         """Print the total number of parameters in the network and (if verbose) network architecture
