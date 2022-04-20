@@ -1,7 +1,6 @@
 import logging, torch, numpy as np, re, cv2 as cv, open3d as op3d
 
 from typing import Union
-from scipy.io import loadmat
 from pytorch3d.structures import Meshes as Meshes_torch
 from pytorch3d.io import load_objs_as_meshes
 from pytorch3d.renderer import (
@@ -15,14 +14,9 @@ from pytorch3d.renderer import (
         TexturesVertex,
 )
 from pathlib import Path
-from frontalization.basel_face_model_2009 import BaselFaceModel2009
 
-path_bfm_model = Path('../BFM/01_MorphableModel.mat')
-path_additional_bfm = Path('../BFM/facemodel_info.mat')
+
 path_mean_face_mesh = Path('/tmp/mean_face_mesh_basel.obj')
-path_landmarks_bfm_indeces = Path('../BFM/landmarks68_BFM.anl')
-path_bfm_prepared = Path('../BFM/BFM_model_front.mat')
-
 
 class DtypeTransformator():
 
@@ -95,15 +89,20 @@ class Render():
 
 
     # TODO: something incorrect
-    def get_torch_mesh_object_from_mesh(self, mesh):
+    def get_torch_mesh_object_from_mesh(self, mesh, white_texture:bool=False):
         data = mesh.tensor_mesh_objects
         verts, faces, textures = data['vertices'], data['triangles'], data['textures']
         verts = DtypeTransformator.wrapp_tensor(verts, device=self.device_str_repr, dtype='float32',
                                                 add_batch_axis=True)
         faces = DtypeTransformator.wrapp_tensor(faces, device=self.device_str_repr, dtype='float32',
                                                 add_batch_axis=True)
-        textures = DtypeTransformator.wrapp_tensor(textures, device=self.device_str_repr, dtype='float32',
-                                                   add_batch_axis=True)
+        if white_texture:
+            textures = torch.ones_like(verts, device=self.device_str_repr, dtype=torch.float32)
+        else:
+            textures = DtypeTransformator.wrapp_tensor(textures,
+                                                       device=self.device_str_repr,
+                                                       dtype='float32',
+                                                       add_batch_axis=True)
         texture_vertex = TexturesVertex(verts_features=textures)
         return Meshes_torch(verts=verts, faces=faces, textures=texture_vertex)
 
@@ -117,16 +116,20 @@ class Render():
 
 
     # for experiment purposes
-    def _define_render_instance(self, use_lokk_at_view:bool=False):
-        if use_lokk_at_view:
-            R, T = look_at_view_transform(1, 0, 0)
+    def define_render_instance(self, use_look_at_view:bool=True):
+        if use_look_at_view:
+            R, T = look_at_view_transform(3.0, 0, 0, degrees=True)
             cameras = FoVPerspectiveCameras(device=self._device, R=R, T=T)
         else:
             # default
             cameras = FoVPerspectiveCameras(device=self._device)
 
         raster_settings = RasterizationSettings(image_size=512, blur_radius=0.0, faces_per_pixel=1)
-        lights = PointLights(device=self._device, location=[[0.0, 0.0, -3.0]])
+        lights = PointLights(device=self._device,
+                             ambient_color=((0.8, 0.8, 0.8),),
+                             specular_color=((0.5, 0.5, 0.5),),
+                             diffuse_color=((0.1, 0.1, 0.1), ),
+                             location=[[3.0, 3.0, -3.0]])
 
         renderer = MeshRenderer(
             rasterizer=MeshRasterizer(cameras=cameras, raster_settings=raster_settings),
@@ -134,24 +137,3 @@ class Render():
         )
         return renderer
 
-# TODO: does not work
-def test_render_mean_face_not_worked():
-    bfm = BaselFaceModel2009(path_bfm_model, path_bfm_prepared_model=path_bfm_prepared,
-                             path_landmark_label=path_landmarks_bfm_indeces, create_mean_face_mesh=False)
-    render = Render()
-    mesh_torch = render.get_torch_mesh_object_from_mesh(mesh=bfm.get_mean_face_mesh_custom)
-    render_instance = render._define_render_instance()
-    output = render_instance(mesh_torch)
-    cv.imshow('win1', output[0, ..., :3].cpu().numpy())
-    cv.waitKey()
-    logging.info(f"we get: {mesh_torch}, render: {render_instance}, output render: {output}")
-    print(f"we get: {mesh_torch}, render: {render_instance}, output render: {output}")
-
-
-if __name__ == '__main__':
-    #test_render_mean_face_not_worked()
-    bfm = BaselFaceModel2009(path_bfm_model,
-                             path_landmark_label=path_landmarks_bfm_indeces,
-                             path_bfm_triangulation=path_additional_bfm)
-    meshs = bfm.get_mean_face_mesh_open3d_with_kpts()
-    op3d.visualization.draw_geometries(meshs)
